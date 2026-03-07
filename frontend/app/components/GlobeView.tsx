@@ -1,8 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
-import * as THREE from "three";
-import { fetchSatellitePositions } from "../lib/api";
+import { useEffect, useRef, useState } from "react";
+import { fetchSatellites, fetchSatellitePositions } from "../lib/api";
 
 type Sat = {
   satelliteId: number;
@@ -10,6 +9,7 @@ type Sat = {
   latitude: number;
   longitude: number;
   altitudeKm: number;
+  type?: string;
 };
 
 type GlobeInstance = {
@@ -20,13 +20,15 @@ type GlobeInstance = {
   globeImageUrl: (url: string) => GlobeInstance;
   showAtmosphere: (v: boolean) => GlobeInstance;
   atmosphereAltitude: (v: number) => GlobeInstance;
-  objectsData: (d: any[]) => GlobeInstance;
-  objectLat: (a: any) => GlobeInstance;
-  objectLng: (a: any) => GlobeInstance;
-  objectAltitude: (a: any) => GlobeInstance;
-  objectLabel: (a: any) => GlobeInstance;
-  objectFacesSurface: (v: boolean) => GlobeInstance;
-  objectThreeObject: (fn: any) => GlobeInstance;
+  atmosphereColor: (c: string) => GlobeInstance;
+  showGraticules: (v: boolean) => GlobeInstance;
+  pointsData: (d: any[]) => GlobeInstance;
+  pointLat: (a: any) => GlobeInstance;
+  pointLng: (a: any) => GlobeInstance;
+  pointAltitude: (a: any) => GlobeInstance;
+  pointColor: (a: any) => GlobeInstance;
+  pointRadius: (a: any) => GlobeInstance;
+  pointLabel: (a: any) => GlobeInstance;
   pointOfView: (pov: { lat: number; lng: number; altitude: number }, ms?: number) => GlobeInstance;
 };
 
@@ -77,12 +79,41 @@ export default function GlobeView() {
   const globeRef = useRef<GlobeInstance | null>(null);
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
   const [satellites, setSatellites] = useState<Sat[]>([]);
+  const [satType, setSatType] = useState<string>("Popular");
+  const [satIds, setSatIds] = useState<{ id: number; name: string }[]>([]);
 
-  const markerGeometry = useMemo(() => new THREE.SphereGeometry(0.8, 12, 12), []);
-  const markerMaterial = useMemo(
-    () => new THREE.MeshBasicMaterial({ color: 0x00e5ff }),
-    []
-  );
+  const SAT_TYPES = [
+    "Popular",
+    "Stations",
+    "Starlink",
+    "OneWeb",
+    "GPS",
+    "GLONASS",
+    "Galileo",
+    "BeiDou",
+    "Communications",
+    "Geostationary",
+    "Weather",
+    "Earth Imaging",
+    "Amateur",
+  ];
+
+  // Maps display label → backend params (type = CelesTrak group name, group = curated list)
+  const SAT_TYPE_OPTS: Record<string, { type?: string; group?: string }> = {
+    "Popular":       { group: "popular" },
+    "Stations":      { type: "STATIONS" },
+    "Starlink":      { type: "STARLINK" },
+    "OneWeb":        { type: "ONEWEB" },
+    "GPS":           { type: "GPS-OPS" },
+    "GLONASS":       { type: "GLO-OPS" },
+    "Galileo":       { type: "GALILEO" },
+    "BeiDou":        { type: "BEIDOU" },
+    "Communications":{ type: "INTELSAT" },
+    "Geostationary": { type: "GEO" },
+    "Weather":       { type: "NOAA" },
+    "Earth Imaging": { type: "RESOURCE" },
+    "Amateur":       { type: "AMATEUR" },
+  };
 
   useEffect(() => {
     const init = async () => {
@@ -94,19 +125,20 @@ export default function GlobeView() {
 
       const starBg = generateStarfieldDataUrl();
       const globe = new GlobeCtor(containerRef.current)
-        .backgroundColor("#000008")
+        .backgroundColor("#000011")
         .backgroundImageUrl(starBg)
-        // Using the globe.gl example texture (fast to get started)
         .globeImageUrl("//unpkg.com/three-globe/example/img/earth-dark.jpg")
         .showAtmosphere(true)
-        .atmosphereAltitude(0.18)
-        .objectLat("latitude")
-        .objectLng("longitude")
-        .objectAltitude((d: any) => d.altitudeRatio)
-        .objectLabel((d: any) => `${d.name} (#${d.satelliteId})`)
-        .objectFacesSurface(false)
-        .objectThreeObject(() => new THREE.Mesh(markerGeometry, markerMaterial))
-        .objectsData([]);
+        .atmosphereAltitude(0.12)
+        .atmosphereColor("rgba(100, 150, 255, 0.4)")
+        .showGraticules(true)
+        .pointLat("latitude")
+        .pointLng("longitude")
+        .pointAltitude((d: any) => d.altitudeRatio)
+        .pointColor((d: any) => d.color)
+        .pointRadius(0.2)
+        .pointLabel((d: any) => `${d.name} — ${Math.round(d.altitudeKm ?? 0)} km`)
+        .pointsData([]);
 
       globe.pointOfView({ lat: 20, lng: 0, altitude: 2.2 }, 0);
 
@@ -126,13 +158,34 @@ export default function GlobeView() {
     init();
 
     return () => {};
-  }, [markerGeometry, markerMaterial]);
+  }, []);
 
+  // Fetch satellite list ONCE when the type changes
   useEffect(() => {
+    let aborted = false;
+    setSatellites([]);
+    setSatIds([]);
+    const opts = SAT_TYPE_OPTS[satType] ?? { search: satType };
+    fetchSatellites(1, 30, opts)
+      .then((resp) => {
+        if (aborted) return;
+        const ids = (resp.satellites ?? [])
+          .filter((x: any) => typeof x?.satelliteId === "number")
+          .map((x: any) => ({ id: x.satelliteId, name: x.name ?? String(x.satelliteId) }));
+        setSatIds(ids);
+      })
+      .catch((e) => console.error("Failed to load satellite list", e));
+    return () => { aborted = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [satType]);
+
+  // Poll positions every second using the fetched IDs
+  useEffect(() => {
+    if (satIds.length === 0) return;
     let timer: number | null = null;
     let aborted = false;
-
-    const ids = [25544, 49260, 20580, 33591, 28654, 25338, 48274];
+    const ids = satIds.map((s) => s.id);
+    const nameMap = Object.fromEntries(satIds.map((s) => [s.id, s.name]));
 
     const tick = async () => {
       try {
@@ -142,7 +195,7 @@ export default function GlobeView() {
           .filter((x) => typeof x?.satelliteId === "number")
           .map((x) => ({
             satelliteId: x.satelliteId,
-            name: x.name ?? String(x.satelliteId),
+            name: x.name ?? nameMap[x.satelliteId] ?? String(x.satelliteId),
             latitude: x.latitude,
             longitude: x.longitude,
             altitudeKm: x.altitudeKm,
@@ -150,11 +203,9 @@ export default function GlobeView() {
         setSatellites(sats);
         setLastUpdated(new Date().toLocaleTimeString());
       } catch (e) {
-        // Keep trying; network tab will show failures
-        // eslint-disable-next-line no-console
-        console.error("satellite update failed", e);
+        console.error("satellite position update failed", e);
       } finally {
-        timer = window.setTimeout(tick, 1000);
+        if (!aborted) timer = window.setTimeout(tick, 5000);
       }
     };
 
@@ -163,15 +214,17 @@ export default function GlobeView() {
       aborted = true;
       if (timer) window.clearTimeout(timer);
     };
-  }, []);
+  }, [satIds]);
 
   useEffect(() => {
     if (!globeRef.current) return;
-    const objects = satellites.map((s) => ({
+    const SATELLITE_COLORS = ["#ff9800", "#ffeb3b", "#8bc34a", "#ff5722", "#ffc107", "#4caf50", "#ffa726"];
+    const points = satellites.map((s, i) => ({
       ...s,
       altitudeRatio: Math.max(0, Math.min(0.5, (s.altitudeKm ?? 0) / EARTH_RADIUS_KM)),
+      color: SATELLITE_COLORS[i % SATELLITE_COLORS.length],
     }));
-    globeRef.current.objectsData(objects);
+    globeRef.current.pointsData(points);
   }, [satellites]);
 
   return (
@@ -194,6 +247,19 @@ export default function GlobeView() {
         }}
       >
         <div style={{ fontWeight: 700, marginBottom: 6 }}>Lune Globe</div>
+        <div style={{ marginBottom: 8 }}>
+          <label htmlFor="sat-type-select" style={{ marginRight: 8 }}>Type:</label>
+          <select
+            id="sat-type-select"
+            value={satType}
+            onChange={e => setSatType(e.target.value)}
+            style={{ fontSize: 13, padding: "2px 8px", borderRadius: 6, background: "#222", color: "#fff" }}
+          >
+            {SAT_TYPES.map(type => (
+              <option key={type} value={type}>{type}</option>
+            ))}
+          </select>
+        </div>
         <div>Satellites: {satellites.length}</div>
         <div>Update: {lastUpdated ?? "--"}</div>
         <div style={{ marginTop: 6, color: "rgba(255,255,255,0.75)" }}>

@@ -6,23 +6,17 @@ import lombok.Data;
 
 @Data
 @JsonIgnoreProperties(ignoreUnknown = true)
-public class TleDto {
+public class CelestrakSatelliteDto {
 
-    @JsonProperty("satelliteId")
-    private Integer satelliteId;
-
-    @JsonProperty("name")
+    @JsonProperty("OBJECT_NAME")
     private String name;
 
-    @JsonProperty("date")
-    private String date;
+    @JsonProperty("NORAD_CAT_ID")
+    private Integer noradCatId;
 
-    @JsonProperty("line1")
+    @JsonProperty("TLE_LINE1")
     private String line1;
 
-    @JsonProperty("line2")
+    @JsonProperty("TLE_LINE2")
     private String line2;
-
-    @JsonProperty("type")
-    private String type; // e.g. Internet, Communications, etc.
 }

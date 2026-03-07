@@ -29,16 +29,17 @@ public class SatelliteController {
      * group=popular (curated list only, no external catalog call).
      */
     @GetMapping(produces = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<SatelliteListResponseDto> list(
+        public ResponseEntity<SatelliteListResponseDto> list(
             @RequestParam(defaultValue = "1") int page,
             @RequestParam(defaultValue = "20") int pageSize,
             @RequestParam(required = false) String search,
             @RequestParam(required = false) String sort,
-            @RequestParam(required = false) String group) {
+            @RequestParam(required = false) String group,
+            @RequestParam(required = false) String type) {
         SatelliteListResponseDto body = satelliteService.getSatellites(
-                page, Math.min(pageSize, 50), search, sort, group);
+            page, Math.min(pageSize, 50), search, sort, group, type);
         return ResponseEntity.ok(body);
-    }
+        }
 
     /**
      * Get one satellite's TLE by NORAD ID.
