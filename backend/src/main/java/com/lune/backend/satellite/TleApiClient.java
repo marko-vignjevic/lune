@@ -13,7 +13,9 @@ import org.springframework.web.util.UriComponentsBuilder;
 import java.net.URI;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
+import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Component
 @RequiredArgsConstructor
@@ -26,6 +28,17 @@ public class TleApiClient {
     private String baseUrl;
 
     private static final DateTimeFormatter ISO_FORMAT = DateTimeFormatter.ISO_INSTANT;
+
+    /** Simple in-memory cache for propagation results to avoid hitting TLE API rate limits. */
+    private static final long CACHE_TTL_MS = 30_000; // 30 seconds
+    private final Map<Integer, CachedResult> propagationCache = new ConcurrentHashMap<>();
+
+    private record CachedResult(PropagationResultDto result, long timestamp) {}
+
+    private void evictStaleEntries() {
+        long now = System.currentTimeMillis();
+        propagationCache.entrySet().removeIf(e -> now - e.getValue().timestamp() > CACHE_TTL_MS * 2);
+    }
 
     /**
      * Fetch paginated list of satellites (TLE catalog).
@@ -67,8 +80,15 @@ public class TleApiClient {
 
     /**
      * Get propagated position at a given instant (UTC).
+     * Results are cached for up to 30 s per satellite to stay within TLE API rate limits (500 req/day).
      */
     public Optional<PropagationResultDto> propagate(int satelliteId, Instant instant) {
+        // Return cached result if fresh enough
+        CachedResult cached = propagationCache.get(satelliteId);
+        if (cached != null && System.currentTimeMillis() - cached.timestamp() < CACHE_TTL_MS) {
+            return Optional.ofNullable(cached.result());
+        }
+
         String datetime = ISO_FORMAT.format(instant);
         URI uri = UriComponentsBuilder.fromUriString(baseUrl + "/api/tle/" + satelliteId + "/propagate")
                 .queryParam("datetime", datetime)
@@ -76,9 +96,17 @@ public class TleApiClient {
                 .toUri();
         try {
             PropagationResultDto result = restTemplate.getForObject(uri, PropagationResultDto.class);
+            if (result != null) {
+                propagationCache.put(satelliteId, new CachedResult(result, System.currentTimeMillis()));
+                evictStaleEntries();
+            }
             return Optional.ofNullable(result);
         } catch (Exception e) {
             log.warn("Propagate failed for id {} at {}: {}", satelliteId, datetime, e.getMessage());
+            // Return stale cache if available rather than empty
+            if (cached != null) {
+                return Optional.ofNullable(cached.result());
+            }
             return Optional.empty();
         }
     }

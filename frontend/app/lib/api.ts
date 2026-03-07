@@ -3,7 +3,7 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
 export async function fetchSatellites(
   page = 1,
   pageSize = 20,
-  opts?: { search?: string; sort?: string; group?: string }
+  opts?: { search?: string; sort?: string; group?: string; type?: string }
 ) {
   const params = new URLSearchParams({
     page: String(page),
@@ -12,6 +12,7 @@ export async function fetchSatellites(
   if (opts?.search) params.set("search", opts.search);
   if (opts?.sort) params.set("sort", opts.sort);
   if (opts?.group) params.set("group", opts.group);
+  if (opts?.type) params.set("type", opts.type);
   const res = await fetch(`${API_BASE}/api/satellites?${params.toString()}`);
   if (!res.ok) throw new Error(`Satellites: ${res.status}`);
   return res.json();

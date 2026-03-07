@@ -8,6 +8,7 @@ import org.springframework.stereotype.Service;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Service
 @RequiredArgsConstructor
@@ -17,6 +18,7 @@ public class SatelliteService {
     private static final DateTimeFormatter ISO_FORMAT = DateTimeFormatter.ISO_INSTANT;
     private static final int DEFAULT_TRAIL_POINTS_EACH_SIDE = 5;
     private static final double MIN_SPEED_KM_S = 2.0; // avoid div by zero for very slow objects
+    private static final long TLE_CACHE_TTL_MS = 3600_000; // cache TLE data for 1 hour
 
     /** Curated "popular" satellites – no external list call, fast response. */
     private static final List<SatelliteListItemDto> POPULAR_SATELLITES = List.of(
@@ -29,13 +31,41 @@ public class SatelliteService {
             item(49260, "LANDSAT 9")
     );
 
+    /** Valid CelesTrak group names — these bypass tle.ivanstanojevic.me and use CelesTrak directly. */
+    private static final Set<String> CELESTRAK_GROUPS = Set.of(
+            "STATIONS", "STARLINK", "ONEWEB", "GPS-OPS", "GLO-OPS",
+            "GALILEO", "BEIDOU", "INTELSAT", "SES", "IRIDIUM",
+            "IRIDIUM-NEXT", "ORBCOMM", "GLOBALSTAR", "AMATEUR",
+            "NOAA", "GOES", "RESOURCE", "SARSAT", "GEO", "ACTIVE"
+    );
+
     private static SatelliteListItemDto item(int id, String name) {
         return SatelliteListItemDto.builder().satelliteId(id).name(name).tleDate(null).build();
     }
 
     private final TleApiClient tleApiClient;
+    private final CelestrakApiClient celestrakApiClient;
+    private final Sgp4Propagator sgp4Propagator;
 
-    public SatelliteListResponseDto getSatellites(int page, int pageSize, String search, String sort, String group) {
+    /** Cache of TLE data fetched from CelesTrak, keyed by NORAD ID. */
+    private record CachedTle(CelestrakSatelliteDto tle, long fetchedAt) {}
+    private final Map<Integer, CachedTle> tleCache = new ConcurrentHashMap<>();
+
+    /**
+     * Get TLE for a satellite — uses in-memory cache (1h TTL) backed by CelesTrak.
+     */
+    private Optional<CelestrakSatelliteDto> getCachedTle(int satelliteId) {
+        CachedTle cached = tleCache.get(satelliteId);
+        if (cached != null && System.currentTimeMillis() - cached.fetchedAt() < TLE_CACHE_TTL_MS) {
+            return Optional.of(cached.tle());
+        }
+        Optional<CelestrakSatelliteDto> opt = celestrakApiClient.getSatellite(satelliteId);
+        opt.ifPresent(tle -> tleCache.put(satelliteId, new CachedTle(tle, System.currentTimeMillis())));
+        return opt;
+    }
+
+    public SatelliteListResponseDto getSatellites(int page, int pageSize, String search, String sort, String group, String type) {
+        // popular group — fast curated list, no external call
         if ("popular".equalsIgnoreCase(group != null ? group.strip() : null)) {
             int total = POPULAR_SATELLITES.size();
             int from = Math.min((page - 1) * pageSize, total);
@@ -48,6 +78,32 @@ public class SatelliteService {
                     .pageSize(pageSize)
                     .build();
         }
+
+        // CelesTrak group — fetch by category
+        String celestrakGroup = type != null ? type.strip().toUpperCase() : null;
+        if (celestrakGroup != null && CELESTRAK_GROUPS.contains(celestrakGroup)) {
+            List<CelestrakSatelliteDto> raw = celestrakApiClient.getGroup(celestrakGroup);
+            int total = raw.size();
+            int from = Math.min((page - 1) * pageSize, total);
+            int to = Math.min(from + pageSize, total);
+            List<SatelliteListItemDto> items = raw.subList(from, to).stream()
+                    .filter(s -> s.getNoradCatId() != null)
+                    .map(s -> SatelliteListItemDto.builder()
+                            .satelliteId(s.getNoradCatId())
+                            .name(s.getName())
+                            .tleDate(null)
+                            .type(celestrakGroup)
+                            .build())
+                    .toList();
+            return SatelliteListResponseDto.builder()
+                    .satellites(items)
+                    .totalItems(total)
+                    .page(page)
+                    .pageSize(pageSize)
+                    .build();
+        }
+
+        // Fallback: tle.ivanstanojevic.me name search
         TleListResponseDto raw = tleApiClient.getTleList(page, pageSize, search, sort);
         if (raw == null || raw.getMember() == null) {
             return SatelliteListResponseDto.builder()
@@ -62,21 +118,45 @@ public class SatelliteService {
                         .satelliteId(tle.getSatelliteId())
                         .name(tle.getName())
                         .tleDate(tle.getDate())
+                        .type(type)
                         .build())
                 .toList();
         return SatelliteListResponseDto.builder()
                 .satellites(items)
-                .totalItems(raw.getTotalItems() != null ? raw.getTotalItems() : items.size())
+                .totalItems(items.size())
                 .page(raw.getParameters() != null && raw.getParameters().getPage() != null ? raw.getParameters().getPage() : page)
                 .pageSize(raw.getParameters() != null && raw.getParameters().getPageSize() != null ? raw.getParameters().getPageSize() : pageSize)
                 .build();
     }
 
     public Optional<TleDto> getSatellite(int satelliteId) {
+        // Try CelesTrak first (no strict rate limit)
+        Optional<CelestrakSatelliteDto> celestrak = getCachedTle(satelliteId);
+        if (celestrak.isPresent()) {
+            CelestrakSatelliteDto c = celestrak.get();
+            TleDto dto = new TleDto();
+            dto.setSatelliteId(c.getNoradCatId());
+            dto.setName(c.getName());
+            dto.setLine1(c.getLine1());
+            dto.setLine2(c.getLine2());
+            return Optional.of(dto);
+        }
+        // Fallback: tle.ivanstanojevic.me (may be rate-limited)
         return tleApiClient.getTle(satelliteId);
     }
 
     public Optional<SatellitePositionDto> getPosition(int satelliteId, Instant instant) {
+        // Primary: local SGP4 propagation using CelesTrak TLE (no rate limits)
+        Optional<CelestrakSatelliteDto> tleOpt = getCachedTle(satelliteId);
+        if (tleOpt.isPresent()) {
+            CelestrakSatelliteDto tle = tleOpt.get();
+            Optional<PropagationResultDto> result = sgp4Propagator.propagate(
+                    tle.getName(), satelliteId, tle.getLine1(), tle.getLine2(), instant);
+            if (result.isPresent()) {
+                return result.map(r -> toPositionDto(r, instant));
+            }
+        }
+        // Fallback: external TLE API (may be rate-limited)
         return tleApiClient.propagate(satelliteId, instant)
                 .map(r -> toPositionDto(r, instant));
     }
@@ -84,9 +164,56 @@ public class SatelliteService {
     /**
      * Get current position plus trail points (past and future) for orbit trail visualization.
      * trailKm: approximate distance in km each direction (default 30).
-     * Uses the external TLE propagate API for each point; for high traffic consider adding local SGP4.
+     * Uses local SGP4 propagation — no external API call per trail point.
      */
     public Optional<SatelliteTrailDto> getTrail(int satelliteId, Instant instant, double trailKm) {
+        // Try local SGP4 first
+        Optional<CelestrakSatelliteDto> tleOpt = getCachedTle(satelliteId);
+        if (tleOpt.isPresent()) {
+            return getTrailLocal(tleOpt.get(), satelliteId, instant, trailKm);
+        }
+        // Fallback: external API
+        return getTrailExternal(satelliteId, instant, trailKm);
+    }
+
+    private Optional<SatelliteTrailDto> getTrailLocal(CelestrakSatelliteDto tle, int satelliteId, Instant instant, double trailKm) {
+        Optional<PropagationResultDto> currentOpt = sgp4Propagator.propagate(
+                tle.getName(), satelliteId, tle.getLine1(), tle.getLine2(), instant);
+        if (currentOpt.isEmpty()) return Optional.empty();
+
+        SatellitePositionDto currentPos = toPositionDto(currentOpt.get(), instant);
+        double speedKmPerSec = Math.max(currentPos.getSpeedKmPerSec(), MIN_SPEED_KM_S);
+        double timeSpanSec = trailKm / speedKmPerSec;
+        int pointsEachSide = Math.min(DEFAULT_TRAIL_POINTS_EACH_SIDE, 15);
+        double stepSec = timeSpanSec / pointsEachSide;
+
+        List<TrailPointDto> trail = new ArrayList<>();
+        for (int i = pointsEachSide; i >= 1; i--) {
+            Instant t = instant.minusSeconds((long) (i * stepSec));
+            sgp4Propagator.propagate(tle.getName(), satelliteId, tle.getLine1(), tle.getLine2(), t)
+                    .map(PropagationResultDto::getVector)
+                    .map(VectorDto::getPosition)
+                    .ifPresent(p -> trail.add(TrailPointDto.builder()
+                            .datetime(ISO_FORMAT.format(t)).x(p.getX()).y(p.getY()).z(p.getZ()).build()));
+        }
+        trail.add(TrailPointDto.builder()
+                .datetime(ISO_FORMAT.format(instant))
+                .x(currentPos.getPositionX()).y(currentPos.getPositionY()).z(currentPos.getPositionZ()).build());
+        for (int i = 1; i <= pointsEachSide; i++) {
+            Instant t = instant.plusSeconds((long) (i * stepSec));
+            sgp4Propagator.propagate(tle.getName(), satelliteId, tle.getLine1(), tle.getLine2(), t)
+                    .map(PropagationResultDto::getVector)
+                    .map(VectorDto::getPosition)
+                    .ifPresent(p -> trail.add(TrailPointDto.builder()
+                            .datetime(ISO_FORMAT.format(t)).x(p.getX()).y(p.getY()).z(p.getZ()).build()));
+        }
+
+        return Optional.of(SatelliteTrailDto.builder()
+                .satelliteId(satelliteId).name(currentPos.getName())
+                .current(currentPos).trail(trail).build());
+    }
+
+    private Optional<SatelliteTrailDto> getTrailExternal(int satelliteId, Instant instant, double trailKm) {
         Optional<PropagationResultDto> currentOpt = tleApiClient.propagate(satelliteId, instant);
         if (currentOpt.isEmpty()) return Optional.empty();
 

@@ -14,4 +14,5 @@ public class SatelliteListItemDto {
     private Integer satelliteId;
     private String name;
     private String tleDate; // last TLE update
+    private String type; // e.g. Internet, Communications, etc.
 }

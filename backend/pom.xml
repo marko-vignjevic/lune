@@ -55,6 +55,12 @@
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-webflux</artifactId>
 		</dependency>
+		<!-- SGP4/SDP4 local orbit propagation -->
+		<dependency>
+			<groupId>com.github.davidmoten</groupId>
+			<artifactId>predict4java</artifactId>
+			<version>1.3.1</version>
+		</dependency>
 	</dependencies>
 
 	<build>
